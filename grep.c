@@ -1469,22 +1469,24 @@ typedef struct node {
 } node;
 
 /* Head of loose queue structure */
-struct node *nodeHead = NULL;
+struct node *headNode = NULL;
 
 /* Lock queue when moving heads */
 pthread_rwlock_t nodeLock;
 pthread_rwlockattr_t writeAttr;
 pthread_mutex_t queueLock = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t headNodeUpdate = PTHREAD_COND_INITIALIZER;
 
 /* implementation of double linked list, returns false if ID is no match */
 static bool
 sendNodeToBack( pthread_t ID )
 {
   /* Lock queue head from being read */
+  pthread_mutex_lock( &queueLock );
   pthread_rwlock_wrlock( &nodeLock );
   bool retVal = true;
 
-  struct node *p = nodeHead;
+  struct node *p = headNode;
   while( p != NULL && p->ID != ID )
     p = p->next;
   if( p == NULL ) /* ID was not found */
@@ -1495,10 +1497,11 @@ sendNodeToBack( pthread_t ID )
   {
     struct node *last = p;
     /* if node is head */
-    if( last == nodeHead )
+    if( last == headNode )
     {
-      nodeHead = nodeHead->next;
-      nodeHead->prev = NULL;
+      headNode = headNode->next;
+      headNode->prev = NULL;
+      pthread_cond_signal( &headNodeUpdate );
     }
     else
     {
@@ -1512,7 +1515,8 @@ sendNodeToBack( pthread_t ID )
     last->prev = p;
     last->next = NULL;
   }
-  pthread_rwlock_unlock( &nodeLock ); 
+  pthread_rwlock_unlock( &nodeLock );
+  pthread_mutex_unlock( &queueLock );
   return retVal;
 }
 
@@ -1521,8 +1525,8 @@ isNodeHead( pthread_t ID )
 {
   pthread_rwlock_rdlock( &nodeLock );
   bool val = false;
-  if( nodeHead != NULL )
-    val = ( ID == nodeHead->ID );
+  if( headNode != NULL )
+    val = ( ID == headNode->ID );
   pthread_rwlock_unlock( &nodeLock );
   return val;
 }
@@ -1533,15 +1537,15 @@ addNode( struct node *n )
   pthread_mutex_lock( &queueLock );
   pthread_rwlock_rdlock( &nodeLock );
 
-  if( nodeHead == NULL )
+  if( headNode == NULL )
   {
-    nodeHead = n;
+    headNode = n;
     n->prev = NULL;
     n->next = NULL;
   }
   else
   {
-    struct node *p = nodeHead;
+    struct node *p = headNode;
     while( p->next != NULL )
       p = p->next;
     /* found last node */
@@ -1560,7 +1564,7 @@ deleteNode( pthread_t ID )
   pthread_mutex_lock( &queueLock );
   pthread_rwlock_rdlock( &nodeLock );
 
-  struct node *p = nodeHead;
+  struct node *p = headNode;
   while( p != NULL && p->ID != ID )
     p = p->next;
 
@@ -1570,8 +1574,11 @@ deleteNode( pthread_t ID )
     return false;
   }
   /* 3 conditions, p is head */
-  if( p == nodeHead )
-    nodeHead = p->next;    
+  if( p == headNode )
+  {
+    headNode = p->next;
+    pthread_cond_signal( &headNodeUpdate );
+  }
   /* p is last */
   else if( p->next == NULL )
     p->prev = NULL;
@@ -1678,27 +1685,41 @@ grep (struct grepctx *ctx, int fd, struct stat const *st,
         {
           if (ctx->outleft) 
             {
-              if( isNodeHead( ID ) )
+              while( ~isNodeHead( ID ) )
               {
-                *locked = true;
-                //printf( "Locking" );
-                lock_output ();
+                pthread_mutex_lock( &queueLock );
+                pthread_cond_wait( &headNodeUpdate, &queueLock );
+                pthread_mutex_unlock( &queueLock );
               }
+              lock_output();
+              *locked = true;
               nlines += grepbuf (ctx, beg, lim);
             }
           if (ctx->pending)
             {
-              if( isNodeHead( ID ) )
+              while( ~isNodeHead( ID ) )
               {
-                *locked = true;
-                //printf( "Locking" );
-                lock_output ();
+                pthread_mutex_lock( &queueLock );
+                pthread_cond_wait( &headNodeUpdate, &queueLock );
+                pthread_mutex_unlock( &queueLock );
               }
+              lock_output ();
+              *locked = true;
               prpending (ctx, lim);
             }
           if ((!ctx->outleft && !ctx->pending)
               || (ctx->done_on_match && MAX (0, nlines_first_null) < nlines))
+          {
+            while( ~isNodeHead( ID ) )
+            { 
+              pthread_mutex_lock( &queueLock );
+              pthread_cond_wait( &headNodeUpdate, &queueLock );
+              pthread_mutex_unlock( &queueLock );
+            }
+            lock_output();
+            *locked = true;
             goto finish_grep;
+          }
         }
 
       /* The last OUT_BEFORE lines at the end of the buffer will be needed as
