@@ -1,13 +1,16 @@
 /* grep.c - main driver file for grep.
    Copyright (C) 1992, 1997-2002, 2004-2016 Free Software Foundation, Inc.
+
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
    the Free Software Foundation; either version 3, or (at your option)
    any later version.
+
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
    GNU General Public License for more details.
+
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
    Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston, MA
@@ -49,6 +52,8 @@
 #include "version-etc.h"
 #include "xalloc.h"
 #include "xstrtol.h"
+
+#include <gperftools/profiler.h>
 
 #define SEP_CHAR_SELECTED ':'
 #define SEP_CHAR_REJECTED '-'
@@ -181,6 +186,7 @@ static const char *group_separator = SEP_STR_GROUP;
          are available for the purpose of choosing defaults for everyone.
       -- The most prevalent default terminal backgrounds are pure black
          and pure white, and are not necessarily the same shades of
+                iuppressible_error( "Locking", 0 );
          those as if they were selected explicitly with SGR sequences.
          Some terminals use dark or light pictures as default background,
          but those are covered over by an explicit selection of background
@@ -250,6 +256,7 @@ static const char *context_line_color  = "";	/* default color pair */
             background color, and to complement doing it after START).
             Piping grep's output through a pager such as less(1) avoids
             any HT problems since the pager performs tab expansion.
+
       Generic disadvantages of this remedy are:
          -- Some very rare terminals might support SGR but not EL (nobody
             will use "grep --color" on a terminal that does not support
@@ -263,6 +270,7 @@ static const char *context_line_color  = "";	/* default color pair */
             bottom of the screen.
       There are no additional disadvantages specific to doing it after
       SGR END.
+
       It would be impractical for GNU grep to become a full-fledged
       terminal program linked against ncurses or the like, so it will
       not detect terminfo(5) capabilities.  */
@@ -551,11 +559,14 @@ static execute_fp_t execute;
 
 static pthread_mutex_t output_lock;
 
+static void suppressible_error (char const *mesg, int errnum);
+
 static void
 lock_output (void)
 {
   if (pthread_mutex_lock (&output_lock))
     abort ();
+  //printf ( "Locking" );
 }
 
 static void
@@ -563,6 +574,7 @@ unlock_output (void)
 {
   if (pthread_mutex_unlock (&output_lock))
     abort ();
+  //printf ( "Unlocking" );
 }
 
 /* Thread-safe error() */
@@ -1067,6 +1079,7 @@ print_offset (uintmax_t pos, int min_width, const char *color)
    The output data comes from what is perhaps a larger input line that
    goes until LIM, where LIM[-1] is an end-of-line byte.  Use SEP as
    the separator on output.
+
    Return true unless the line was suppressed due to an encoding error.  */
 
 static bool
@@ -1287,7 +1300,7 @@ prpending (struct grepctx *ctx, char const *lim)
 {
   if (!ctx->lastout)
     ctx->lastout = ctx->bufbeg;
-  lock_output ();
+  //lock_output ();
   while (ctx->pending > 0 && ctx->lastout < lim)
     {
       char *nl = memchr (ctx->lastout, eolbyte, lim - ctx->lastout);
@@ -1302,7 +1315,7 @@ prpending (struct grepctx *ctx, char const *lim)
       else
         ctx->pending = 0;
     }
-  unlock_output ();
+  //unlock_output ();
 }
 
 /* Output the lines between BEG and LIM.  Deal with context.  */
@@ -1319,7 +1332,7 @@ prtext (struct grepctx *ctx, char *beg, char *lim)
 
   char *p = beg;
 
-  lock_output ();
+  //lock_output ();
 
   if (!ctx->out_quiet)
     {
@@ -1379,7 +1392,7 @@ prtext (struct grepctx *ctx, char *beg, char *lim)
   used = true;
   ctx->outleft -= n;
 
-  unlock_output ();
+  //unlock_output ();
 }
 
 /* Replace all NUL bytes in buffer P (which ends at LIM) with EOL.
@@ -1446,9 +1459,139 @@ grepbuf (struct grepctx *ctx, char *beg, char const *lim)
   return outleft0 - ctx->outleft;
 }
 
+
+/* We need to keep track of which threads have priority printing 
+   Implemented with a queue with a double linked list implementation */
+typedef struct node {
+  pthread_t ID; /* of thread */
+  struct node *next;
+  struct node *prev;
+} node;
+
+/* Head of loose queue structure */
+struct node *nodeHead = NULL;
+
+/* Lock queue when moving heads */
+pthread_rwlock_t nodeLock;
+pthread_rwlockattr_t writeAttr;
+pthread_mutex_t queueLock = PTHREAD_MUTEX_INITIALIZER;
+
+/* implementation of double linked list, returns false if ID is no match */
+static bool
+sendNodeToBack( pthread_t ID )
+{
+  /* Lock queue head from being read */
+  pthread_rwlock_wrlock( &nodeLock );
+  bool retVal = true;
+
+  struct node *p = nodeHead;
+  while( p != NULL && p->ID != ID )
+    p = p->next;
+  if( p == NULL ) /* ID was not found */
+    retVal = false;
+  else if( p->next == NULL ) /* p is last node */
+    retVal = true;
+  else
+  {
+    struct node *last = p;
+    /* if node is head */
+    if( last == nodeHead )
+    {
+      nodeHead = nodeHead->next;
+      nodeHead->prev = NULL;
+    }
+    else
+    {
+      p->next->prev = p->prev;
+      p->prev->next = p->next;
+    }
+
+    while( p->next != NULL ) /* find the last node */
+      p = p->next;
+    p->next = last;
+    last->prev = p;
+    last->next = NULL;
+  }
+  pthread_rwlock_unlock( &nodeLock ); 
+  return retVal;
+}
+
+static bool
+isNodeHead( pthread_t ID )
+{
+  pthread_rwlock_rdlock( &nodeLock );
+  bool val = false;
+  if( nodeHead != NULL )
+    val = ( ID == nodeHead->ID );
+  pthread_rwlock_unlock( &nodeLock );
+  return val;
+}
+
+static bool
+addNode( struct node *n )
+{
+  pthread_mutex_lock( &queueLock );
+  pthread_rwlock_rdlock( &nodeLock );
+
+  if( nodeHead == NULL )
+  {
+    nodeHead = n;
+    n->prev = NULL;
+    n->next = NULL;
+  }
+  else
+  {
+    struct node *p = nodeHead;
+    while( p->next != NULL )
+      p = p->next;
+    /* found last node */
+    p->next = n;
+    n->prev = p;
+    n->next = NULL;
+  }
+  pthread_rwlock_unlock( &nodeLock );
+  pthread_mutex_unlock( &queueLock );
+  return true;
+}
+
+static bool
+deleteNode( pthread_t ID )
+{
+  pthread_mutex_lock( &queueLock );
+  pthread_rwlock_rdlock( &nodeLock );
+
+  struct node *p = nodeHead;
+  while( p != NULL && p->ID != ID )
+    p = p->next;
+
+  if( p == NULL )
+  {
+    pthread_mutex_unlock( &queueLock );
+    return false;
+  }
+  /* 3 conditions, p is head */
+  if( p == nodeHead )
+    nodeHead = p->next;    
+  /* p is last */
+  else if( p->next == NULL )
+    p->prev = NULL;
+  /* p is in the middle of the queue */
+  else
+  {
+    p->prev->next = p->next;
+    p->next->prev = p->prev;
+  }
+
+  free( p );
+  pthread_rwlock_unlock( &nodeLock );
+  pthread_mutex_unlock( &queueLock );
+  return true;
+}
+
 /* Search a given (non-directory) file.  Return a count of lines printed. */
 static intmax_t
-grep (struct grepctx *ctx, int fd, struct stat const *st)
+grep (struct grepctx *ctx, int fd, struct stat const *st, 
+    pthread_t ID, bool *locked )
 {
   intmax_t nlines, i;
   size_t residue, save;
@@ -1533,10 +1676,26 @@ grep (struct grepctx *ctx, int fd, struct stat const *st)
 
       if (beg < lim)
         {
-          if (ctx->outleft)
-            nlines += grepbuf (ctx, beg, lim);
+          if (ctx->outleft) 
+            {
+              if( isNodeHead( ID ) )
+              {
+                *locked = true;
+                //printf( "Locking" );
+                lock_output ();
+              }
+              nlines += grepbuf (ctx, beg, lim);
+            }
           if (ctx->pending)
-            prpending (ctx, lim);
+            {
+              if( isNodeHead( ID ) )
+              {
+                *locked = true;
+                //printf( "Locking" );
+                lock_output ();
+              }
+              prpending (ctx, lim);
+            }
           if ((!ctx->outleft && !ctx->pending)
               || (ctx->done_on_match && MAX (0, nlines_first_null) < nlines))
             goto finish_grep;
@@ -1588,12 +1747,13 @@ grep (struct grepctx *ctx, int fd, struct stat const *st)
       && (ctx->encoding_error_output
           || (0 <= nlines_first_null && nlines_first_null < nlines)))
     {
-      lock_output ();
+      //lock_output ();
       printf_errno (_("Binary file %s matches\n"), ctx->filename);
       if (line_buffered)
         fflush_errno ();
-      unlock_output ();
+      //unlock_output ();
     }
+    //unlock_output();
   return nlines;
 }
 
@@ -1618,10 +1778,11 @@ static struct
 
 static intmax_t max_queued_files;
 
+
 /* Retrieve a workfile from the work queue, returning NULL if there's
    nothing left to process. */
 static struct workfile *
-dequeue_workfile (void)
+dequeue_workfile ( pthread_t ID )
 {
   struct workfile *wf;
 
@@ -1638,6 +1799,7 @@ dequeue_workfile (void)
         workqueue.tail = NULL;
       workqueue.num_files--;
       pthread_cond_signal (&workqueue.producer_cond);
+      sendNodeToBack( ID );
     }
   pthread_mutex_unlock (&workqueue.lock);
 
@@ -1686,6 +1848,8 @@ worker_thread_func (void *arg)
   struct grepctx ctx;
   intmax_t count;
   bool status = true;
+  bool l = false;
+  bool *locked; locked = &l;
 
   memset (&ctx, 0, sizeof (ctx));
   if (pagesize == 0 || 2 * pagesize + 1 <= pagesize)
@@ -1698,7 +1862,12 @@ worker_thread_func (void *arg)
   ctx.done_on_match = done_on_match;
   ctx.compiled_pattern = arg;
 
-  while ((wf = dequeue_workfile ()))
+  /* create node on loose queue */
+  struct node *n = (struct node*) malloc( sizeof( node ) );
+  n->ID = pthread_self(); n->next = NULL; n->prev = NULL;
+  addNode( n );
+
+  while (( wf = dequeue_workfile (pthread_self()) ))
     {
       ctx.filename = wf->path;
 
@@ -1709,11 +1878,11 @@ worker_thread_func (void *arg)
         SET_BINARY (wf->fd);
 #endif
 
-      count = grep (&ctx, wf->fd, &wf->st);
+      count = grep (&ctx, wf->fd, &wf->st, pthread_self(), locked);
       status = !count && status;
       if (count_matches)
         {
-          lock_output ();
+          //lock_output ();
           if (out_file)
             {
               print_filename (&ctx);
@@ -1725,18 +1894,18 @@ worker_thread_func (void *arg)
           printf_errno ("%" PRIdMAX "\n", count);
           if (line_buffered)
             fflush_errno ();
-          unlock_output ();
+          //unlock_output ();
         }
 
       if ((list_files == LISTFILES_MATCHING && count > 0)
           || (list_files == LISTFILES_NONMATCHING && count == 0))
         {
-          lock_output ();
+          //lock_output ();
           print_filename (&ctx);
           putchar_errno ('\n' & filename_mask);
           if (line_buffered)
             fflush_errno ();
-          unlock_output ();
+          //unlock_output ();
         }
 
       if (wf->fd == STDIN_FILENO)
@@ -1753,8 +1922,14 @@ worker_thread_func (void *arg)
         suppressible_error (wf->path, errno);
       free (wf->path);
       free (wf);
+      // only unlock if the lock has been placed
+      if( *locked )
+        unlock_output();
+      *locked = false;
+      
     }
-
+  /* clean up memeory */
+  deleteNode( pthread_self() ); 
   return (void *) status;
 }
 
@@ -2392,6 +2567,8 @@ fgrep_to_grep_pattern (size_t len, char const *keys,
 int
 main (int argc, char **argv)
 {
+  //ProfilerStart("pgrep.log");
+
   char *keys;
   size_t keycc, oldcc, keyalloc;
   bool with_filenames;
@@ -2442,6 +2619,12 @@ main (int argc, char **argv)
       || pthread_cond_init (&workqueue.producer_cond, NULL)
       || pthread_cond_init (&workqueue.consumer_cond, NULL))
     abort ();
+
+  pthread_rwlockattr_init(&writeAttr);
+  pthread_rwlockattr_setkind_np
+      ( &writeAttr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP );
+  pthread_rwlock_init(&nodeLock, &writeAttr);
+   
 
   /* Internationalization. */
 #if defined HAVE_SETLOCALE
@@ -2946,7 +3129,8 @@ main (int argc, char **argv)
         abort ();
       status = status && !!worker_status;
     }
-
+  
+  //ProfilerStop();
   /* We register via atexit() to test stdout.  */
   return errseen ? EXIT_TROUBLE : status;
 }
