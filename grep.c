@@ -1501,7 +1501,7 @@ sendNodeToBack( pthread_t ID )
     {
       headNode = headNode->next;
       headNode->prev = NULL;
-      pthread_cond_signal( &headNodeUpdate );
+      pthread_cond_broadcast( &headNodeUpdate );
     }
     else
     {
@@ -1535,13 +1535,14 @@ static bool
 addNode( struct node *n )
 {
   pthread_mutex_lock( &queueLock );
-  pthread_rwlock_rdlock( &nodeLock );
+  pthread_rwlock_wrlock( &nodeLock );
 
   if( headNode == NULL )
   {
     headNode = n;
     n->prev = NULL;
     n->next = NULL;
+    pthread_cond_broadcast( &headNodeUpdate );
   }
   else
   {
@@ -1562,7 +1563,7 @@ static bool
 deleteNode( pthread_t ID )
 {
   pthread_mutex_lock( &queueLock );
-  pthread_rwlock_rdlock( &nodeLock );
+  pthread_rwlock_wrlock( &nodeLock );
 
   struct node *p = headNode;
   while( p != NULL && p->ID != ID )
@@ -1577,7 +1578,7 @@ deleteNode( pthread_t ID )
   if( p == headNode )
   {
     headNode = p->next;
-    pthread_cond_signal( &headNodeUpdate );
+    pthread_cond_broadcast( &headNodeUpdate );
   }
   /* p is last */
   else if( p->next == NULL )
@@ -1685,39 +1686,45 @@ grep (struct grepctx *ctx, int fd, struct stat const *st,
         {
           if (ctx->outleft) 
             {
-              while( ~isNodeHead( ID ) )
-              {
-                pthread_mutex_lock( &queueLock );
+              pthread_mutex_lock( &queueLock );
+              while( !isNodeHead( ID ) )
                 pthread_cond_wait( &headNodeUpdate, &queueLock );
-                pthread_mutex_unlock( &queueLock );
+              pthread_mutex_unlock( &queueLock );
+              
+              if( !*locked )
+              {
+                lock_output();
+                *locked = true;
               }
-              lock_output();
-              *locked = true;
               nlines += grepbuf (ctx, beg, lim);
             }
           if (ctx->pending)
             {
-              while( ~isNodeHead( ID ) )
-              {
-                pthread_mutex_lock( &queueLock );
+              pthread_mutex_lock( &queueLock );
+              while( !isNodeHead( ID ) )
                 pthread_cond_wait( &headNodeUpdate, &queueLock );
-                pthread_mutex_unlock( &queueLock );
+              pthread_mutex_unlock( &queueLock );
+
+              if ( !*locked )
+              {
+                lock_output ();
+                *locked = true;
               }
-              lock_output ();
-              *locked = true;
               prpending (ctx, lim);
             }
           if ((!ctx->outleft && !ctx->pending)
               || (ctx->done_on_match && MAX (0, nlines_first_null) < nlines))
           {
-            while( ~isNodeHead( ID ) )
-            { 
-              pthread_mutex_lock( &queueLock );
+            pthread_mutex_lock( &queueLock );
+            while( !isNodeHead( ID ) )
               pthread_cond_wait( &headNodeUpdate, &queueLock );
-              pthread_mutex_unlock( &queueLock );
+            pthread_mutex_unlock( &queueLock );
+            
+            if( !*locked )
+            {
+              lock_output();
+              *locked = true;
             }
-            lock_output();
-            *locked = true;
             goto finish_grep;
           }
         }

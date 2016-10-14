@@ -1,1 +1,5 @@
 A patch for the mulithreaded implementaiton proposed by Zev Weiss.
+
+Directions: Clone the following patch https://github.com/zevweiss/grep
+Replace the grep.c file found in the src folder.
+Run ./bootstrap && ./configure && ./make
