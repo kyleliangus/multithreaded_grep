@@ -1293,172 +1293,7 @@ prline (struct grepctx *ctx, char *beg, char *lim, char sep)
   ctx->lastout = lim;
 }
 
-/* Print pending lines of trailing context prior to LIM. Trailing context ends
-   at the next matching line when OUTLEFT is 0.  */
-static void
-prpending (struct grepctx *ctx, char const *lim)
-{
-  if (!ctx->lastout)
-    ctx->lastout = ctx->bufbeg;
-  //lock_output ();
-  while (ctx->pending > 0 && ctx->lastout < lim)
-    {
-      char *nl = memchr (ctx->lastout, eolbyte, lim - ctx->lastout);
-      size_t match_size;
-      --ctx->pending;
-      if (ctx->outleft
-          || ((execute (ctx->compiled_pattern, ctx, ctx->lastout,
-                        nl + 1 - ctx->lastout, &match_size, NULL)
-               == (size_t) -1)
-              == !out_invert))
-        prline (ctx, ctx->lastout, nl + 1, SEP_CHAR_REJECTED);
-      else
-        ctx->pending = 0;
-    }
-  //unlock_output ();
-}
-
-/* Output the lines between BEG and LIM.  Deal with context.  */
-static void
-prtext (struct grepctx *ctx, char *beg, char *lim)
-{
-  /* Avoid printing SEP_STR_GROUP before any output.  Static is OK here since
-     it's only accessed under output_lock. */
-  static bool used;
-  char eol = eolbyte;
-
-  if (!ctx->out_quiet && ctx->pending > 0)
-    prpending (ctx, beg);
-
-  char *p = beg;
-
-  //lock_output ();
-
-  if (!ctx->out_quiet)
-    {
-      /* Deal with leading context.  */
-      char const *bp = ctx->lastout ? ctx->lastout : ctx->bufbeg;
-      intmax_t i;
-      for (i = 0; i < out_before; ++i)
-        if (p > bp)
-          do
-            --p;
-          while (p[-1] != eol);
-
-      /* Print the group separator unless the output is adjacent to
-         the previous output in the file.  */
-      if ((0 <= out_before || 0 <= out_after) && used
-          && p != ctx->lastout && group_separator)
-        {
-          pr_sgr_start_if (sep_color);
-          fputs_errno (group_separator);
-          pr_sgr_end_if (sep_color);
-          putchar_errno ('\n');
-        }
-
-      while (p < beg)
-        {
-          char *nl = memchr (p, eol, beg - p);
-          nl++;
-          prline (ctx, p, nl, SEP_CHAR_REJECTED);
-          p = nl;
-        }
-    }
-
-  intmax_t n;
-  if (out_invert)
-    {
-      /* One or more lines are output.  */
-      for (n = 0; p < lim && n < ctx->outleft; n++)
-        {
-          char *nl = memchr (p, eol, lim - p);
-          nl++;
-          if (!ctx->out_quiet)
-            prline (ctx, p, nl, SEP_CHAR_SELECTED);
-          p = nl;
-        }
-    }
-  else
-    {
-      /* Just one line is output.  */
-      if (!ctx->out_quiet)
-        prline (ctx, beg, lim, SEP_CHAR_SELECTED);
-      n = 1;
-      p = lim;
-    }
-
-  ctx->after_last_match = ctx->bufoffset - (ctx->buflim - p);
-  ctx->pending = ctx->out_quiet ? 0 : MAX (0, out_after);
-  used = true;
-  ctx->outleft -= n;
-
-  //unlock_output ();
-}
-
-/* Replace all NUL bytes in buffer P (which ends at LIM) with EOL.
-   This avoids running out of memory when binary input contains a long
-   sequence of zeros, which would otherwise be considered to be part
-   of a long line.  P[LIM] should be EOL.  */
-static void
-zap_nuls (char *p, char *lim, char eol)
-{
-  if (eol)
-    while (true)
-      {
-        *lim = '\0';
-        p += strlen (p);
-        *lim = eol;
-        if (p == lim)
-          break;
-        do
-          *p++ = eol;
-        while (!*p);
-      }
-}
-
-/* Scan the specified portion of the buffer, matching lines (or
-   between matching lines if OUT_INVERT is true).  Return a count of
-   lines printed.  Replace all NUL bytes with NUL_ZAPPER as we go.  */
-static intmax_t
-grepbuf (struct grepctx *ctx, char *beg, char const *lim)
-{
-  intmax_t outleft0 = ctx->outleft;
-  char *endp;
-
-  for (char *p = beg; p < lim; p = endp)
-    {
-      size_t match_size;
-      size_t match_offset = execute (ctx->compiled_pattern, ctx, p, lim - p,
-                                     &match_size, NULL);
-      if (match_offset == (size_t) -1)
-        {
-          if (!out_invert)
-            break;
-          match_offset = lim - p;
-          match_size = 0;
-        }
-      char *b = p + match_offset;
-      endp = b + match_size;
-      /* Avoid matching the empty line at the end of the buffer. */
-      if (!out_invert && b == lim)
-        break;
-      if (!out_invert || p < b)
-        {
-          char *prbeg = out_invert ? p : b;
-          char *prend = out_invert ? b : endp;
-          prtext (ctx, prbeg, prend);
-          if (!ctx->outleft || ctx->done_on_match)
-            {
-              if (exit_on_match)
-                exit (errseen ? exit_failure : EXIT_SUCCESS);
-              break;
-            }
-        }
-    }
-
-  return outleft0 - ctx->outleft;
-}
-
+/* Multithreading Implementation */
 
 /* We need to keep track of which threads have priority printing 
    Implemented with a queue with a double linked list implementation */
@@ -1596,6 +1431,203 @@ deleteNode( pthread_t ID )
   return true;
 }
 
+/* Multithreading implementation */
+
+
+/* Print pending lines of trailing context prior to LIM. Trailing context ends
+   at the next matching line when OUTLEFT is 0.  */
+static void
+prpending (struct grepctx *ctx, char const *lim, pthread_t ID, bool *locked)
+{
+  if (!ctx->lastout)
+    ctx->lastout = ctx->bufbeg;
+  //lock_output ();
+
+  /* FIXME ADD locks here */
+
+  if( !*locked )
+  {
+    pthread_mutex_lock( &queueLock );
+    while( !isNodeHead( ID ) )
+      pthread_cond_wait( &headNodeUpdate, &queueLock );
+    pthread_mutex_unlock( &queueLock );
+
+    lock_output();
+    *locked = true;
+  }
+
+  while (ctx->pending > 0 && ctx->lastout < lim)
+    {
+      char *nl = memchr (ctx->lastout, eolbyte, lim - ctx->lastout);
+      size_t match_size;
+      --ctx->pending;
+      if (ctx->outleft
+          || ((execute (ctx->compiled_pattern, ctx, ctx->lastout,
+                        nl + 1 - ctx->lastout, &match_size, NULL)
+               == (size_t) -1)
+              == !out_invert))
+        prline (ctx, ctx->lastout, nl + 1, SEP_CHAR_REJECTED);
+      else
+        ctx->pending = 0;
+    }
+  //unlock_output ();
+}
+
+/* Output the lines between BEG and LIM.  Deal with context.  */
+static void
+prtext (struct grepctx *ctx, char *beg, char *lim, pthread_t ID, bool *locked)
+{
+  /* Avoid printing SEP_STR_GROUP before any output.  Static is OK here since
+     it's only accessed under output_lock. */
+  static bool used;
+  char eol = eolbyte;
+
+  if (!ctx->out_quiet && ctx->pending > 0)
+    prpending (ctx, beg, ID, locked);
+
+  char *p = beg;
+
+  //lock_output ();
+
+  /* FIXME Add locks here */
+  if ( !*locked )
+  {
+    pthread_mutex_lock( &queueLock );
+    while( !isNodeHead( ID ) )
+      pthread_cond_wait( &headNodeUpdate, &queueLock );
+    pthread_mutex_unlock( &queueLock );
+    
+    lock_output ();
+    *locked = true;
+  }
+  
+  if (!ctx->out_quiet)
+    {
+      /* Deal with leading context.  */
+      char const *bp = ctx->lastout ? ctx->lastout : ctx->bufbeg;
+      intmax_t i;
+      for (i = 0; i < out_before; ++i)
+        if (p > bp)
+          do
+            --p;
+          while (p[-1] != eol);
+
+      /* Print the group separator unless the output is adjacent to
+         the previous output in the file.  */
+      if ((0 <= out_before || 0 <= out_after) && used
+          && p != ctx->lastout && group_separator)
+        {
+          pr_sgr_start_if (sep_color);
+          fputs_errno (group_separator);
+          pr_sgr_end_if (sep_color);
+          putchar_errno ('\n');
+        }
+
+      while (p < beg)
+        {
+          char *nl = memchr (p, eol, beg - p);
+          nl++;
+          prline (ctx, p, nl, SEP_CHAR_REJECTED);
+          p = nl;
+        }
+    }
+
+  intmax_t n;
+  if (out_invert)
+    {
+      /* One or more lines are output.  */
+      for (n = 0; p < lim && n < ctx->outleft; n++)
+        {
+          char *nl = memchr (p, eol, lim - p);
+          nl++;
+          if (!ctx->out_quiet)
+            prline (ctx, p, nl, SEP_CHAR_SELECTED);
+          p = nl;
+        }
+    }
+  else
+    {
+      /* Just one line is output.  */
+      if (!ctx->out_quiet)
+        prline (ctx, beg, lim, SEP_CHAR_SELECTED);
+      n = 1;
+      p = lim;
+    }
+
+  ctx->after_last_match = ctx->bufoffset - (ctx->buflim - p);
+  ctx->pending = ctx->out_quiet ? 0 : MAX (0, out_after);
+  used = true;
+  ctx->outleft -= n;
+
+  //unlock_output ();
+}
+
+/* Replace all NUL bytes in buffer P (which ends at LIM) with EOL.
+   This avoids running out of memory when binary input contains a long
+   sequence of zeros, which would otherwise be considered to be part
+   of a long line.  P[LIM] should be EOL.  */
+static void
+zap_nuls (char *p, char *lim, char eol)
+{
+  if (eol)
+    while (true)
+      {
+        *lim = '\0';
+        p += strlen (p);
+        *lim = eol;
+        if (p == lim)
+          break;
+        do
+          *p++ = eol;
+        while (!*p);
+      }
+}
+
+/* Scan the specified portion of the buffer, matching lines (or
+   between matching lines if OUT_INVERT is true).  Return a count of
+   lines printed.  Replace all NUL bytes with NUL_ZAPPER as we go.  */
+static intmax_t
+grepbuf (struct grepctx *ctx, char *beg, char const *lim, 
+pthread_t ID, bool *locked)
+{
+  intmax_t outleft0 = ctx->outleft;
+  char *endp;
+
+  for (char *p = beg; p < lim; p = endp)
+    {
+      size_t match_size;
+      size_t match_offset = execute (ctx->compiled_pattern, ctx, p, lim - p,
+                                     &match_size, NULL);
+      if (match_offset == (size_t) -1)
+        {
+          if (!out_invert)
+            break;
+          match_offset = lim - p;
+          match_size = 0;
+        }
+      char *b = p + match_offset;
+      endp = b + match_size;
+      /* Avoid matching the empty line at the end of the buffer. */
+      if (!out_invert && b == lim)
+        break;
+      if (!out_invert || p < b)
+        {
+          char *prbeg = out_invert ? p : b;
+          char *prend = out_invert ? b : endp;
+          prtext (ctx, prbeg, prend, ID, locked);
+          if (!ctx->outleft || ctx->done_on_match)
+            {
+              if (exit_on_match)
+                exit (errseen ? exit_failure : EXIT_SUCCESS);
+              break;
+            }
+        }
+    }
+
+  return outleft0 - ctx->outleft;
+}
+
+
 /* Search a given (non-directory) file.  Return a count of lines printed. */
 static intmax_t
 grep (struct grepctx *ctx, int fd, struct stat const *st, 
@@ -1685,48 +1717,12 @@ grep (struct grepctx *ctx, int fd, struct stat const *st,
       if (beg < lim)
         {
           if (ctx->outleft) 
-            {
-              pthread_mutex_lock( &queueLock );
-              while( !isNodeHead( ID ) )
-                pthread_cond_wait( &headNodeUpdate, &queueLock );
-              pthread_mutex_unlock( &queueLock );
-              
-              if( !*locked )
-              {
-                lock_output();
-                *locked = true;
-              }
-              nlines += grepbuf (ctx, beg, lim);
-            }
+            nlines += grepbuf (ctx, beg, lim, ID, locked);
           if (ctx->pending)
-            {
-              pthread_mutex_lock( &queueLock );
-              while( !isNodeHead( ID ) )
-                pthread_cond_wait( &headNodeUpdate, &queueLock );
-              pthread_mutex_unlock( &queueLock );
-
-              if ( !*locked )
-              {
-                lock_output ();
-                *locked = true;
-              }
-              prpending (ctx, lim);
-            }
+            prpending (ctx, lim, ID, locked);
           if ((!ctx->outleft && !ctx->pending)
               || (ctx->done_on_match && MAX (0, nlines_first_null) < nlines))
-          {
-            pthread_mutex_lock( &queueLock );
-            while( !isNodeHead( ID ) )
-              pthread_cond_wait( &headNodeUpdate, &queueLock );
-            pthread_mutex_unlock( &queueLock );
-            
-            if( !*locked )
-            {
-              lock_output();
-              *locked = true;
-            }
             goto finish_grep;
-          }
         }
 
       /* The last OUT_BEFORE lines at the end of the buffer will be needed as
@@ -1763,9 +1759,10 @@ grep (struct grepctx *ctx, int fd, struct stat const *st,
     {
       *ctx->buflim++ = eol;
       if (ctx->outleft)
-        nlines += grepbuf (ctx, ctx->bufbeg + save - residue, ctx->buflim);
+        nlines += 
+          grepbuf (ctx, ctx->bufbeg + save - residue, ctx->buflim, ID, locked);
       if (ctx->pending)
-        prpending (ctx, ctx->buflim);
+        prpending (ctx, ctx->buflim, ID, locked);
     }
 
  finish_grep:
@@ -1775,7 +1772,17 @@ grep (struct grepctx *ctx, int fd, struct stat const *st,
       && (ctx->encoding_error_output
           || (0 <= nlines_first_null && nlines_first_null < nlines)))
     {
-      //lock_output ();
+            
+      if( !*locked )
+      {
+        pthread_mutex_lock( &queueLock );
+        while( !isNodeHead( ID ) )
+          pthread_cond_wait( &headNodeUpdate, &queueLock );
+        pthread_mutex_unlock( &queueLock );
+        lock_output();
+        *locked = true;
+      }
+      
       printf_errno (_("Binary file %s matches\n"), ctx->filename);
       if (line_buffered)
         fflush_errno ();
